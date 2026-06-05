@@ -1,0 +1,135 @@
+# ═══════════════════════════════════════════════════
+#  Gold Price Real-Time Pipeline — Docker Compose
+#  Services:
+#    1. Redpanda       → Message Bus      :19092
+#    2. Redpanda Console → UI             :8080
+#    3. QuestDB        → Time-Series DB   :9000 / 9009 / 8812
+#    4. Grafana        → Monitoring       :3000
+# ═══════════════════════════════════════════════════
+
+networks:
+  gold-net:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  questdb-data:
+  grafana-data:
+
+services:
+
+  # ─────────────────────────────────────────
+  #  1. REDPANDA — Kafka-compatible Message Bus
+  # ─────────────────────────────────────────
+  redpanda:
+    image: redpandadata/redpanda:latest
+    container_name: redpanda
+    networks:
+      - gold-net
+    ports:
+      - "19092:19092"   # Kafka API (external) → your Python connects here
+      - "9644:9644"     # Admin API
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    command:
+      - redpanda
+      - start
+      - --kafka-addr
+      - internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr
+      - internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr
+      - internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr
+      - internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr
+      - internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr
+      - redpanda:33145
+      - --advertise-rpc-addr
+      - redpanda:33145
+      - --mode
+      - dev-container          # optimized for local dev
+      - --smp
+      - "1"                    # single core (local machine)
+      - --memory
+      - "512M"                 # cap memory usage
+      - --reserve-memory
+      - "0M"
+      - --default-log-level=warn
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  #  2. REDPANDA CONSOLE — Web UI for topics
+  #     Open: http://localhost:8080
+  # ─────────────────────────────────────────
+  redpanda-console:
+    image: redpandadata/console:latest
+    container_name: redpanda-console
+    networks:
+      - gold-net
+    ports:
+      - "8080:8080"
+    environment:
+      CONFIG_FILEPATH: /etc/redpanda/config.yaml
+    volumes:
+      - ./redpanda-console-config.yaml:/etc/redpanda/config.yaml:ro
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  #  3. QUESTDB — Time-Series Database
+  #     Web UI:        http://localhost:9000
+  #     ILP Ingest:    localhost:9009  (Python writes here)
+  #     SQL/Postgres:  localhost:8812  (Python queries here)
+  # ─────────────────────────────────────────
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb
+    networks:
+      - gold-net
+    ports:
+      - "9000:9000"   # Web Console UI
+      - "9009:9009"   # InfluxDB Line Protocol (ILP) — fast ingestion
+      - "8812:8812"   # PostgreSQL wire protocol — SQL queries
+    volumes:
+      - questdb-data:/var/lib/questdb
+    environment:
+      - QDB_TELEMETRY_ENABLED=false
+      - QDB_HTTP_ENABLED=true
+      - QDB_LINE_TCP_ENABLED=true
+      - QDB_PG_ENABLED=true
+      - QDB_CAIRO_MAX_UNCOMMITTED_ROWS=1000   # flush every 1000 rows
+      - QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL=100  # ms
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────
+  #  4. GRAFANA — Monitoring Dashboard
+  #     Open:    http://localhost:3000
+  #     Login:   admin / admin  (change on first login)
+  # ─────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    networks:
+      - gold-net
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=questdb-questdb-datasource
+    depends_on:
+      - questdb
+    restart: unless-stopped
